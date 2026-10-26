@@ -1,0 +1,72 @@
+name: Release NuGet Packages via OSS Exit Gate
+
+on:
+  push:
+    tags:
+      - 'Google.Api.*-*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to build and stage via OSS Exit Gate (e.g. Google.Api.Gax-4.9.0)'
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DOTNET_NOLOGO: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup .NET 8.0
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build and pack release packages
+        run: ./buildrelease.sh
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed
+        with:
+          workload_identity_provider: 'projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+
+      - name: Stage NuGet packages to OSS Exit Gate Artifact Registry
+        run: |
+          shopt -s nullglob
+          for nupkg in nuget/*.nupkg; do
+            if [[ "$nupkg" == *.symbols.nupkg ]]; then
+              continue
+            fi
+            base="$(basename "$nupkg" .nupkg)"
+            ver="$(echo "$base" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$')"
+            pkg_id="${base%.$ver}"
+            pkg_lower="$(echo "$pkg_id" | tr '[:upper:]' '[:lower:]')"
+            gcloud artifacts generic upload \
+              --project=oss-exit-gate-prod \
+              --location=us \
+              --repository=gax-dotnet--nuget \
+              --package="${pkg_lower}" \
+              --version="${ver}" \
+              --source="${nupkg}"
+          done
+
+      - name: Trigger OSS Exit Gate release
+        run: |
+          echo '{"publish_all": true}' > manifest.json
+          gcloud storage cp manifest.json \
+            "gs://oss-exit-gate-prod-projects-bucket/gax-dotnet/nuget/manifests/manifest-${{ github.run_id }}-${{ github.run_attempt }}.json"
